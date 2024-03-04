@@ -197,8 +197,8 @@ controller:
   # command: /controller
   # webhookMode: enabled
   image:
-    repository: quay.io/metallb/controller
-    tag:
+    repository: registry.smtx.io/kubesmart/metallb/controller
+    tag: v0.13.10
     pullPolicy:
   ## @param controller.updateStrategy.type Metallb controller deployment strategy type.
   ## ref: https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#strategy
@@ -264,8 +264,8 @@ speaker:
   excludeInterfaces:
     enabled: true
   image:
-    repository: quay.io/metallb/speaker
-    tag:
+    repository: registry.smtx.io/kubesmart/metallb/speaker
+    tag: v0.13.10
     pullPolicy:
   ## @param speaker.updateStrategy.type Speaker daemonset strategy type
   ## ref: https://kubernetes.io/docs/tasks/manage-daemon/update-daemon-set/
@@ -321,7 +321,7 @@ speaker:
   frr:
     enabled: true
     image:
-      repository: quay.io/frrouting/frr
+      repository: registry.smtx.io/kubesmart/frrouting/frr
       tag: 8.4.2
       pullPolicy:
     metricsPort: 7473

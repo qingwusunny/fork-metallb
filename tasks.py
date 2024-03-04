@@ -139,7 +139,8 @@ def _get_subnets_allocated_ips():
 
 def _add_nic_to_nodes(cluster_name):
     nodes = run("kind get nodes --name {name}".format(name=cluster_name)).stdout.strip().split("\n")
-    run("docker network create --ipv6 --subnet {ipv6_subnet} -d bridge {bridge_name}".format(bridge_name=extra_network, ipv6_subnet="fc00:f853:ccd:e791::/64"))
+    if not _is_network_exist(extra_network):
+        run("docker network create --ipv6 --subnet {ipv6_subnet} -d bridge {bridge_name}".format(bridge_name=extra_network, ipv6_subnet="fc00:f853:ccd:e791::/64"))
     for node in nodes:
         run("docker network connect {bridge_name} {node}".format(bridge_name=extra_network, node=node))
 
@@ -381,7 +382,7 @@ apiServer:
                                         "containerPath": "/etc/kubernetes/policies/audit-policy.yaml",
                                         "readOnly": True}]
 
-        networking_config = {}
+        networking_config = {"disableDefaultCNI": True}
         if ip_family != "ipv4":
             networking_config["ipFamily"] = ip_family
 
@@ -399,16 +400,24 @@ apiServer:
             run("kind create cluster --name={} --config={} {}".format(name, tmp.name, extra_options), pty=True, echo=True)
         _add_nic_to_nodes(name)
 
-    binaries = ["controller", "speaker"]
-    if build_images:
-        build(ctx, binaries, architectures=[architecture])
-    run("kind load docker-image --name={} quay.io/metallb/controller:dev-{}".format(name, architecture), echo=True)
-    run("kind load docker-image --name={} quay.io/metallb/speaker:dev-{}".format(name, architecture), echo=True)
+    # binaries = ["controller", "speaker"]
+    # if build_images:
+    #     build(ctx, binaries, architectures=[architecture])
+    # run("kind load docker-image --name={} quay.io/metallb/controller:dev-{}".format(name, architecture), echo=True)
+    # run("kind load docker-image --name={} quay.io/metallb/speaker:dev-{}".format(name, architecture), echo=True)
 
+    print("Deploying cni")
+    deploycni(ctx)
     if with_prometheus:
         print("Deploying prometheus")
         deployprometheus(ctx)
 
+    run("docker pull registry.smtx.io/kubesmart/frrouting/frr:8.4.2")
+    run("docker pull registry.smtx.io/kubesmart/metallb/speaker:v0.13.10")
+    run("docker pull registry.smtx.io/kubesmart/metallb/controller:v0.13.10")
+    run("kind load docker-image --name={} registry.smtx.io/kubesmart/metallb/speaker:v0.13.10".format(name), echo=True)
+    run("kind load docker-image --name={} registry.smtx.io/kubesmart/metallb/controller:v0.13.10".format(name), echo=True)
+    run("kind load docker-image --name={} registry.smtx.io/kubesmart/frrouting/frr:8.4.2".format(name), echo=True)
     if helm_install:
         run("{} apply -f config/native/ns.yaml".format(kubectl_path), echo=True)
         prometheus_values=""
@@ -418,25 +427,24 @@ apiServer:
                                "--set speaker.frr.secureMetricsPort=9121 "
                                "--set prometheus.serviceAccount=prometheus-k8s "
                                "--set prometheus.namespace=monitoring ")
-        run("helm install metallb charts/metallb/ --set controller.image.tag=dev-{} "
-                "--set speaker.image.tag=dev-{} --set speaker.frr.enabled={} --set speaker.logLevel=debug "
-                "--set controller.logLevel=debug {} --namespace metallb-system".format(architecture, architecture, 
-                "true" if bgp_type == "frr" else "false", prometheus_values), echo=True)
+        run("helm install metallb charts/metallb/ --set speaker.frr.enabled={} --set speaker.logLevel=debug "
+                "--set controller.logLevel=debug {} --namespace metallb-system".format("true" if bgp_type == "frr" else "false", prometheus_values), echo=True)
     else:
         run("{} delete po -n metallb-system --all".format(kubectl_path), echo=True)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             manifest_file = tmpdir + "/metallb.yaml"
+            print("---mani:", manifest_file)
 
             generate_manifest(ctx, bgp_type=bgp_type, output=manifest_file, with_prometheus=with_prometheus)
 
             # open file and replace the images with the newely built MetalLB docker images
             with open(manifest_file) as f:
                 manifest = f.read()
-            for image in binaries:
-                manifest = re.sub("image: quay.io/metallb/{}:.*".format(image),
-                            "image: quay.io/metallb/{}:dev-{}".format(image, architecture), manifest)
-                manifest = re.sub("--log-level=info", "--log-level={}".format(log_level), manifest)
+            # for image in binaries:
+            #     # manifest = re.sub("image: quay.io/metallb/{}:.*".format(image),
+            #     #                   "image: quay.io/metallb/{}:dev-{}".format(image, architecture), manifest)
+            #       manifest = re.sub("--log-level=info", "--log-level={}".format(log_level), manifest)
             manifest.replace("--log-level=info", "--log-level=debug")
 
             with open(manifest_file, "w") as f:
@@ -464,13 +472,14 @@ def layer2_dev_env():
     with open("%s/config.yaml.tmpl" % dev_env_dir, 'r') as f:
         layer2_config = "# THIS FILE IS AUTOGENERATED\n" + f.read()
     layer2_config = layer2_config.replace(
-        "SERVICE_V4_RANGE", get_available_ips(4)[0])
+        "SERVICE_V4_RANGE", get_available_ips(4))
     layer2_config = layer2_config.replace(
-        "SERVICE_V6_RANGE", get_available_ips(6)[0])
+        "SERVICE_V6_RANGE", get_available_ips(6))
     with open("%s/config.yaml" % dev_env_dir, 'w') as f:
         f.write(layer2_config)
     # Apply the MetalLB ConfigMap
     run("{} apply -f {}/config.yaml".format(kubectl_path, dev_env_dir))
+    run("{} -n metallb-system wait --for=condition=Ready --all pods --timeout 300s".format(kubectl_path))
 
 # Configure MetalLB in the dev-env for BGP testing. Start an frr based BGP
 # router in a container and configure MetalLB to peer with it.
@@ -918,6 +927,13 @@ def deployprometheus(ctx):
     print("Waiting for prometheus pods to be running")
     run("{} -n monitoring wait --for=condition=Ready --all pods --timeout 300s".format(kubectl_path))
 
+@task
+def deploycni(ctx):
+    fetch_kubectl()
+    run("{} apply -f dev-env/cni/everoute.yaml".format(kubectl_path))
+    print("Waiting for cni pods to be running")
+    run("{} -n kube-system wait --for=condition=Ready --all pods --timeout 300s".format(kubectl_path))
+
 def _fetch_kubectl():
     if not os.path.exists(build_path):
         os.makedirs(build_path, mode=0o750)
@@ -934,5 +950,42 @@ def _fetch_kubectl():
                 return
     run(curl_command)
     run("chmod +x {}".format(kubectl_path))
+
+def fetch_kubectl():
+    _fetch_kubectl()
+
+# @cache
+# def fetch_kubectl():
+#     curl_command = "curl -o {} -LO https://dl.k8s.io/release/{}/bin/$(go env GOOS)/$(go env GOARCH)/kubectl".format(
+#         kubectl_path, kubectl_version)
+#     get_version_command = f"{kubectl_path} version --short"
+#     fetch_dependency(kubectl_path, kubectl_version, curl_command, get_version_command, "Client Version:")
+
+
+# @cache
+# def fetch_controller_gen():
+#     fetch_command = f"GOBIN={build_path}/bin/ GOPATH={build_path} go install sigs.k8s.io/controller-tools/cmd" \
+#                     f"/controller-gen@{controller_gen_version}"
+#     get_version_command = f"{controller_gen_path} --version"
+#     fetch_dependency(controller_gen_path, controller_gen_version, fetch_command, get_version_command, "Version:")
+
+
+# def fetch_dependency(path: str, version: str, fetch_command: str, get_version_command: str,
+#                      version_prefix_in_output: str):
+#     if not os.path.exists(build_path):
+#         os.makedirs(build_path, mode=0o750)
+#     curl_command = "curl -o {} -LO https://dl.k8s.io/release/{}/bin/$(go env GOOS)/$(go env GOARCH)/kubectl".format(kubectl_path, kubectl_version)
+#     if not os.path.exists(kubectl_path):
+#         run(curl_command)
+#         run("chmod +x {}".format(kubectl_path))
+#         return
+#     version = run("{} version --short".format(kubectl_path), warn=True, hide='both').stdout
+#     for line in version.splitlines():
+#         if line.startswith("Client Version:"):
+#             version = line.split(":")[1].strip()
+#             if version == kubectl_version:
+#                 return
+#     run(curl_command)
+#     run("chmod +x {}".format(kubectl_path))
 
 
